@@ -1,0 +1,44 @@
+# pve-hosts-domain, installed as /etc/dhcp/dhclient-enter-hooks.d/pve-hosts-domain
+# Forces the domain of the node FQDN, read from /etc/hosts, as the domain-name of vmbr0.
+# dhclient-script derives the domain and search lines of /etc/resolv.conf from it.
+# Read with source by dhclient-script before make_resolv_conf: do not use exit.
+# local is supported by dash; interface and reason are provided by dhclient-script,
+# new_domain_name is the result read by make_resolv_conf.
+# shellcheck disable=SC3043,SC2154,SC2034
+
+PVEH_IFACE="vmbr0"
+
+pveh_set_domain() {
+    local short domain
+
+    [ "$interface" = "$PVEH_IFACE" ] || return 0
+    case "$reason" in
+        BOUND|RENEW|REBIND|REBOOT|TIMEOUT) ;;
+        *) return 0 ;;
+    esac
+
+    short=$(head -n1 /etc/hostname | tr -d '[:space:]')
+    [ -n "$short" ] || return 0
+
+    # Same rule as pve-hosts: the part of the FQDN following the hostname.
+    domain=$(awk -v s="$short" '
+        /^[[:space:]]*#/ { next }
+        {
+            for (i = 2; i <= NF; i++) if (index($i, s ".") == 1) {
+                d = substr($i, length(s) + 2); sub(/\.$/, "", d)
+                if (d != "") { print d; exit }
+            }
+        }
+    ' /etc/hosts)
+    if [ -z "$domain" ]; then
+        logger -t pve-hosts "no FQDN ${short}.<domain> in /etc/hosts: DHCP domain-name unchanged"
+        return 0
+    fi
+
+    new_domain_name="$domain"
+    return 0
+}
+
+pveh_set_domain
+unset -f pveh_set_domain
+unset PVEH_IFACE

@@ -1,0 +1,12 @@
+[Unit]
+Description=Align the SAN of pve-ssl.pem with the node IP
+Wants=pve-cluster.service
+After=pve-cluster.service pveproxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-hosts-cert
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

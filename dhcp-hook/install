@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# dhcp-hook/install — installs hooks, certificate script and unit, and converts vmbr0 to DHCP.
+# Called by pmn: pmn install dhcp-hook [--dry-run] [--yes] [--domain <domain>]
+#                                      [--hook-only] [--apply-now]
+# Codes: 0 done or nothing to do, 1 error, 2 precondition, 3 cancelled.
+set -euo pipefail
+
+: "${PMN_ROOT:?eseguire tramite pmn}" "${PMN_TOOL_DIR:?eseguire tramite pmn}"
+# shellcheck source=lib/common.sh
+. "$PMN_ROOT/lib/common.sh"
+# shellcheck source=dhcp-hook/common.sh
+. "$PMN_TOOL_DIR/common.sh"
+
+domain_opt="" hook_only=0 apply_now=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --domain) domain_opt=${2:-}; [ -n "$domain_opt" ] || { err "--domain without a value"; exit 2; }; shift 2 ;;
+        --domain=*) domain_opt=${1#--domain=}; shift ;;
+        --hook-only) hook_only=1; shift ;;
+        --apply-now) apply_now=1; shift ;;
+        *) err "unknown option for dhcp-hook install: $1"; exit 2 ;;
+    esac
+done
+domain_opt=${domain_opt%.}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# 1. Preconditions.
+require_root || exit 2
+fail=0
+if [ -z "$S" ]; then
+    command -v ifreload >/dev/null 2>&1 || { err "ifupdown2 missing (ifreload not found)"; fail=1; }
+    [ -x /usr/sbin/dhclient ] || { err "/usr/sbin/dhclient missing (isc-dhcp-client)"; fail=1; }
+fi
+[ -f "$INTERFACES" ] || { err "$INTERFACES missing"; fail=1; }
+[ -z "$(vmbr0_method 2>/dev/null)" ] && { err "no iface $IFACE inet stanza in $INTERFACES"; fail=1; }
+[ -e "$INTERFACES.new" ] && { err "$INTERFACES.new present: network changes pending in the GUI, apply or revert them"; fail=1; }
+short=$(node_short)
+[ -n "$short" ] || { err "$HOSTNAME_FILE empty"; fail=1; }
+[ "$fail" -eq 0 ] || exit 2
+
+# Domain: from the FQDN in /etc/hosts, as the hooks read it. --domain only writes it when
+# missing; it does not replace an existing FQDN.
+domain=$(node_domain)
+hosts_new=""
+if [ -z "$domain" ]; then
+    if [ -z "$domain_opt" ]; then
+        err "no FQDN $short.<domain> in $HOSTS: the hooks would have no domain. Fix /etc/hosts or pass --domain"
+        exit 2
+    fi
+    grep -Eq "^[^#]*[[:space:]]$short([[:space:]]|\$)" "$HOSTS" ||
+        { err "no line for $short in $HOSTS: --domain has no line to complete"; exit 2; }
+    hosts_new="$work/hosts"
+    awk -v s="$short" -v f="$short.$domain_opt" '
+        /^[[:space:]]*#/ { print; next }
+        !done { for (i = 2; i <= NF; i++) if ($i == s) { $i = f " " s; done = 1; break } }
+        { print }
+    ' "$HOSTS" > "$hosts_new"
+    domain=$domain_opt
+elif [ -n "$domain_opt" ] && [ "$domain_opt" != "$domain" ]; then
+    err "$HOSTS already carries domain $domain, different from --domain $domain_opt: fix the FQDN by hand"
+    exit 2
+fi
+log "node $short, domain $domain"
+
+# 2. Plan: what changes.
+changes=0
+if [ -n "$hosts_new" ]; then
+    echo "--- $HOSTS: adding FQDN $short.$domain"
+    show_diff "$HOSTS" "$hosts_new" || true
+    changes=1
+fi
+while IFS=: read -r src dst mode; do
+    if [ -f "$dst" ] && cmp -s "$PMN_TOOL_DIR/$src" "$dst" && [ "$(file_mode "$dst")" = "$mode" ]; then
+        echo "=== $dst: already installed"
+    elif [ ! -e "$dst" ]; then
+        echo "--- $dst ($mode): new, from $src"
+        changes=1
+    else
+        echo "--- $dst ($mode)"
+        show_diff "$dst" "$PMN_TOOL_DIR/$src" || true
+        changes=1
+    fi
+done <<< "$FILES"
+if dhclient_residue; then
+    echo "--- $DHCLIENT_CONF: removing the pve-hosts block of earlier versions"
+    changes=1
+fi
+net_new=""
+method=$(vmbr0_method)
+if [ "$hook_only" -eq 1 ]; then
+    echo "=== $INTERFACES: untouched (--hook-only), $IFACE inet $method"
+elif [ "$method" = dhcp ]; then
+    echo "=== $INTERFACES: $IFACE already inet dhcp"
+elif [ "$method" = static ]; then
+    net_new="$work/interfaces"
+    vmbr0_to_dhcp "$INTERFACES" > "$net_new"
+    echo "--- $INTERFACES: $IFACE from inet static to inet dhcp"
+    show_diff "$INTERFACES" "$net_new" || true
+    changes=1
+else
+    err "$IFACE is inet $method: the conversion only handles inet static"
+    exit 2
+fi
+
+if [ "$changes" -eq 0 ] && [ "$apply_now" -eq 0 ]; then
+    log "dhcp-hook already installed: no changes"
+    exit 0
+fi
+if [ "$PMN_DRY_RUN" = "1" ]; then
+    echo "[dry-run] no changes made"
+    exit 0
+fi
+if [ "$changes" -eq 1 ]; then
+    confirm "Apply the changes listed above?" || { log "installation cancelled"; exit 3; }
+fi
+
+# 3. Execution.
+if [ -n "$hosts_new" ]; then
+    backup_file "$HOSTS"
+    replace_file "$HOSTS" "$hosts_new"
+fi
+while IFS=: read -r src dst mode; do
+    backup_file "$dst"
+    install_file "$PMN_TOOL_DIR/$src" "$dst" "$mode"
+done <<< "$FILES"
+if dhclient_residue; then
+    backup_file "$DHCLIENT_CONF"
+    sed '/^# BEGIN pve-hosts$/,/^# END pve-hosts$/d' "$DHCLIENT_CONF" > "$work/dhclient.conf"
+    replace_file "$DHCLIENT_CONF" "$work/dhclient.conf"
+fi
+if ! sh -n "$EXIT_HOOK" || ! sh -n "$ENTER_HOOK"; then
+    err "invalid hook syntax"
+    exit 1
+fi
+if [ -z "$S" ]; then
+    run-parts --list /etc/dhcp/dhclient-exit-hooks.d | grep -qx "$EXIT_HOOK" ||
+        { err "run-parts does not list $EXIT_HOOK"; exit 1; }
+    run-parts --list /etc/dhcp/dhclient-enter-hooks.d | grep -qx "$ENTER_HOOK" ||
+        { err "run-parts does not list $ENTER_HOOK"; exit 1; }
+    backup_file "$CERT_PEM"
+    systemctl daemon-reload
+    systemctl enable --quiet pve-hosts-cert.service
+    log "pve-hosts-cert.service enabled: runs at next boot or with systemctl start"
+fi
+if [ -n "$net_new" ]; then
+    backup_file "$INTERFACES"
+    replace_file "$INTERFACES" "$net_new"
+fi
+
+# 4. Apply: not by default, because it changes the IP and drops SSH sessions.
+if [ "$apply_now" -eq 1 ]; then
+    warn "ifreload -a changes the IP of $IFACE: an SSH session drops and the node must be reached at the new IP"
+    if confirm "Run ifreload -a now?"; then
+        log "ifreload -a"
+        [ -n "$S" ] || ifreload -a
+        [ -n "$S" ] || systemctl start pve-hosts-cert.service || warn "pve-hosts-cert.service failed: journalctl -t pve-hosts-cert"
+    else
+        log "ifreload -a not run"
+    fi
+elif [ -n "$net_new" ]; then
+    log "network change written but not applied: run ifreload -a from the local console, or reboot the node"
+fi
+log "dhcp-hook installed, backup in $PMN_BACKUP_DIR"

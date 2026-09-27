@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# dhcp-hook/uninstall — removes hooks, certificate script and unit, with backup.
+# Called by pmn: pmn uninstall dhcp-hook [--dry-run] [--yes] [--restore-network]
+# The network is touched only with --restore-network: /etc/network/interfaces goes back to the last
+# backup made by pmn install dhcp-hook.
+# Codes: 0 done or nothing to do, 1 error, 2 precondition, 3 cancelled.
+set -euo pipefail
+
+: "${PMN_ROOT:?eseguire tramite pmn}" "${PMN_TOOL_DIR:?eseguire tramite pmn}"
+# shellcheck source=lib/common.sh
+. "$PMN_ROOT/lib/common.sh"
+# shellcheck source=dhcp-hook/common.sh
+. "$PMN_TOOL_DIR/common.sh"
+
+restore=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --restore-network) restore=1; shift ;;
+        *) err "unknown option for dhcp-hook uninstall: $1"; exit 2 ;;
+    esac
+done
+require_root || exit 2
+
+present=""
+while IFS=: read -r _ dst _; do
+    [ -e "$dst" ] && present="$present $dst"
+done <<< "$FILES"
+residue=0
+dhclient_residue && residue=1
+
+net_backup=""
+if [ "$restore" -eq 1 ]; then
+    # Last backup of interfaces with a static vmbr0: the one made by the conversion to DHCP.
+    # Directory names start with the date, so the glob sorts them. DHCP copies, made by
+    # earlier uninstalls, do not count.
+    for d in "${PMN_BACKUP_BASE:?}"/*-dhcp-hook; do
+        f="$d/etc/network/interfaces"
+        [ -f "$f" ] && [ "$(INTERFACES=$f vmbr0_method)" = static ] && net_backup=$f
+    done
+    [ -n "$net_backup" ] || { err "no backup of $INTERFACES with static $IFACE in ${PMN_BACKUP_BASE}/*-dhcp-hook"; exit 2; }
+    [ -e "$INTERFACES.new" ] && { err "$INTERFACES.new present: network changes pending in the GUI"; exit 2; }
+fi
+
+if [ -z "$present" ] && [ "$residue" -eq 0 ] && { [ -z "$net_backup" ] || cmp -s "$net_backup" "$INTERFACES"; }; then
+    log "dhcp-hook not installed: no changes"
+    exit 0
+fi
+
+for f in $present; do echo "--- removing $f"; done
+[ "$residue" -eq 0 ] || echo "--- $DHCLIENT_CONF: removing the pve-hosts block of earlier versions"
+if [ -n "$net_backup" ]; then
+    echo "--- $INTERFACES: restoring from $net_backup"
+    show_diff "$INTERFACES" "$net_backup" || true
+    warn "the static IP in the backup may not be valid on the network the node is in now"
+fi
+if [ "$PMN_DRY_RUN" = "1" ]; then
+    echo "[dry-run] no changes made"
+    exit 0
+fi
+confirm "Proceed with the removal?" || { log "removal cancelled"; exit 3; }
+
+if [ -z "$S" ] && [ -e "$CERT_UNIT" ]; then
+    systemctl disable --quiet pve-hosts-cert.service || true
+fi
+for f in $present; do
+    backup_file "$f"
+    rm -f "$f"
+    log "removed $f"
+done
+[ -n "$S" ] || systemctl daemon-reload
+if [ "$residue" -eq 1 ]; then
+    backup_file "$DHCLIENT_CONF"
+    tmp=$(mktemp)
+    sed '/^# BEGIN pve-hosts$/,/^# END pve-hosts$/d' "$DHCLIENT_CONF" > "$tmp"
+    replace_file "$DHCLIENT_CONF" "$tmp"
+    rm -f "$tmp"
+fi
+if [ -n "$net_backup" ]; then
+    backup_file "$INTERFACES"
+    replace_file "$INTERFACES" "$net_backup"
+    log "network restored but not applied: ifreload -a from the local console, or reboot"
+fi
+log "dhcp-hook removed, backup in $PMN_BACKUP_DIR"

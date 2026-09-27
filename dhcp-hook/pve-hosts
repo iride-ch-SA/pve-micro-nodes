@@ -1,0 +1,69 @@
+# pve-hosts, installed as /etc/dhcp/dhclient-exit-hooks.d/pve-hosts
+# Aligns /etc/hosts with the IP obtained via DHCP on vmbr0.
+# Read with source by dhclient-script: do not use exit.
+# local is supported by dash; interface and reason are provided by dhclient-script.
+# shellcheck disable=SC3043,SC2154
+
+PVEH_IFACE="vmbr0"
+
+pveh_update_hosts() {
+    local short domain line tmp
+
+    [ "$interface" = "$PVEH_IFACE" ] || return 0
+    [ "${exit_status:-0}" -eq 0 ] || return 0
+    case "$reason" in
+        BOUND|RENEW|REBIND|REBOOT|TIMEOUT) ;;
+        *) return 0 ;;
+    esac
+    [ -n "$new_ip_address" ] || return 0
+
+    short=$(head -n1 /etc/hostname | tr -d '[:space:]')
+    [ -n "$short" ] || { logger -t pve-hosts "empty hostname, no changes"; return 0; }
+    # The domain is the part of the FQDN set at installation that follows the hostname,
+    # read from the /etc/hosts line that this hook rewrites. Same rule in pve-hosts-domain.
+    domain=$(awk -v s="$short" '
+        /^[[:space:]]*#/ { next }
+        {
+            for (i = 2; i <= NF; i++) if (index($i, s ".") == 1) {
+                d = substr($i, length(s) + 2); sub(/\.$/, "", d)
+                if (d != "") { print d; exit }
+            }
+        }
+    ' /etc/hosts)
+    if [ -n "$domain" ]; then
+        line="${new_ip_address} ${short}.${domain} ${short}"
+    else
+        logger -t pve-hosts "no FQDN ${short}.<domain> in /etc/hosts: line without domain"
+        line="${new_ip_address} ${short}"
+    fi
+
+    tmp=$(mktemp /etc/.hosts.XXXXXX) || return 0
+    awk -v s="$short" -v l="$line" '
+        /^[[:space:]]*#/ { print; next }
+        { for (i = 2; i <= NF; i++) if ($i == s) next }
+        { print }
+        $1 == "127.0.0.1" && !done { print l; done = 1 }
+        END { if (!done) print l }
+    ' /etc/hosts > "$tmp"
+
+    if cmp -s "$tmp" /etc/hosts; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    chown root:root "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" /etc/hosts
+    logger -t pve-hosts "reason=$reason ${old_ip_address:-?} -> ${new_ip_address}: /etc/hosts updated"
+
+    [ -x /usr/bin/pvebanner ] && /usr/bin/pvebanner >/dev/null 2>&1
+
+    # --no-block: at boot the unit waits for pve-cluster, which starts after the network.
+    [ -f /etc/systemd/system/pve-hosts-cert.service ] &&
+        systemctl --no-block start pve-hosts-cert.service >/dev/null 2>&1
+    return 0
+}
+
+pveh_update_hosts
+unset -f pveh_update_hosts
+unset PVEH_IFACE

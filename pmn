@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# pmn — controlled installation of the pve-micro-nodes tools on a node.
+# Installed as symlink /usr/local/sbin/pmn -> /opt/pve-micro-nodes/pmn.
+set -euo pipefail
+
+PMN_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+export PMN_ROOT
+# shellcheck source=lib/common.sh
+. "$PMN_ROOT/lib/common.sh"
+
+PMN_STATE_DIR="${PMN_SYSROOT}/var/lib/pve-micro-nodes/installed"
+PMN_BACKUP_BASE="${PMN_SYSROOT}/var/backups/pve-micro-nodes"
+
+usage() {
+    cat <<'EOF'
+Usage: pmn <command> [arguments]
+
+  update [--ref <tag|branch>]    update the clone to the latest tag, or to the given ref
+  list                           available tools
+  status [<tool>]                check result and state recorded at installation
+  install <tool> [--dry-run] [--yes] [tool options]
+  uninstall <tool> [--dry-run] [--yes] [tool options]
+  version                        ref and commit of the clone
+
+Options not recognised by pmn are passed to the tool script.
+EOF
+}
+
+git_root() { git -C "$PMN_ROOT" "$@"; }
+
+current_ref() {
+    git_root describe --tags --exact-match 2>/dev/null ||
+        git_root symbolic-ref --short -q HEAD 2>/dev/null ||
+        echo "(detached)"
+}
+
+current_commit() { git_root rev-parse --short HEAD; }
+
+latest_tag() {
+    git_root tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1
+}
+
+tools() {
+    local d
+    for d in "$PMN_ROOT"/*/; do
+        [ -f "$d/tool.conf" ] && basename "$d"
+    done
+    return 0
+}
+
+# tool_conf <tool>: loads tool.conf into TOOL_* variables of the current shell.
+tool_conf() {
+    # shellcheck disable=SC2034 # TOOL_NAME is part of the contract, not used here
+    TOOL_NAME="" TOOL_VERSION="" TOOL_DESCRIPTION="" TOOL_REQUIRES_PVE=""
+    # shellcheck source=/dev/null
+    . "$PMN_ROOT/$1/tool.conf"
+}
+
+require_tool() {
+    [ -n "${1:-}" ] || { err "no tool given"; usage >&2; exit 2; }
+    [ -f "$PMN_ROOT/$1/tool.conf" ] || { err "unknown tool: $1 (see pmn list)"; exit 2; }
+}
+
+cmd_version() {
+    printf 'ref %s, commit %s\n' "$(current_ref)" "$(current_commit)"
+}
+
+cmd_update() {
+    local ref="" target
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ref) ref=${2:-}; [ -n "$ref" ] || { err "--ref without a value"; exit 2; }; shift 2 ;;
+            --ref=*) ref=${1#--ref=}; shift ;;
+            *) err "unknown option: $1"; exit 2 ;;
+        esac
+    done
+    require_root || exit 2
+    if [ -n "$(git_root status --porcelain --untracked-files=no)" ]; then
+        err "the clone $PMN_ROOT has local changes: update aborted"
+        git_root status --short --untracked-files=no >&2
+        exit 2
+    fi
+    # --force and --prune-tags: tags follow the origin, also after switching to another repository
+    # where the same tag points to the release commit rather than to the development one.
+    git_root fetch --quiet --tags --prune --prune-tags --force origin
+    if [ -z "$ref" ]; then
+        ref=$(latest_tag)
+        [ -n "$ref" ] || { err "no vX.Y.Z tag in the repository: pass --ref"; exit 2; }
+    fi
+    if git_root rev-parse -q --verify "refs/remotes/origin/$ref^{commit}" >/dev/null; then
+        target="origin/$ref"
+    elif git_root rev-parse -q --verify "refs/tags/$ref^{commit}" >/dev/null; then
+        target="refs/tags/$ref"
+    else
+        err "unknown ref: $ref"
+        exit 2
+    fi
+    git_root checkout --quiet --detach "$target"
+    log "clone checked out at $ref ($(current_commit))"
+}
+
+cmd_list() {
+    local t
+    printf '%-16s %-10s %s\n' TOOL VERSION DESCRIPTION
+    for t in $(tools); do
+        tool_conf "$t"
+        printf '%-16s %-10s %s\n' "$t" "$TOOL_VERSION" "$TOOL_DESCRIPTION"
+    done
+}
+
+cmd_status() {
+    local t rc out list worst=0
+    if [ -n "${1:-}" ]; then require_tool "$1"; list=$1; else list=$(tools); fi
+    for t in $list; do
+        tool_conf "$t"
+        printf '== %s %s\n' "$t" "$TOOL_VERSION"
+        if [ -f "$PMN_STATE_DIR/$t" ]; then
+            sed 's/^/   recorded: /' "$PMN_STATE_DIR/$t"
+        else
+            echo "   recorded: no installation through pmn"
+        fi
+        rc=0
+        out=$(tool_env "$t" "$PMN_ROOT/$t/check" 2>&1) || rc=$?
+        [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/   /'
+        case $rc in
+            0) echo "   result: installed and consistent" ;;
+            1) echo "   result: not installed" ;;
+            2) echo "   result: installed but diverging" ;;
+            *) echo "   result: check failed (code $rc)" ;;
+        esac
+        [ "$rc" -le "$worst" ] || worst=$rc
+    done
+    return "$worst"
+}
+
+# tool_env <tool> command...: runs with the contract variables.
+tool_env() {
+    local t=$1; shift
+    PMN_TOOL_DIR="$PMN_ROOT/$t" \
+    PMN_DRY_RUN="$PMN_DRY_RUN" \
+    PMN_YES="$PMN_YES" \
+    PMN_BACKUP_DIR="${PMN_BACKUP_DIR:-}" \
+    PMN_STATE_FILE="$PMN_STATE_DIR/$t" \
+    PMN_BACKUP_BASE="$PMN_BACKUP_BASE" \
+        "$@"
+}
+
+cmd_action() {
+    local action=$1 t=${2:-} rc=0 opts
+    shift 2 || true
+    require_tool "$t"
+    local extra=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) PMN_DRY_RUN=1 ;;
+            --yes|-y) PMN_YES=1 ;;
+            *) extra+=("$1") ;;
+        esac
+        shift
+    done
+    require_root || exit 2
+    tool_conf "$t"
+    if [ -n "$TOOL_REQUIRES_PVE" ] && [ -z "$PMN_SYSROOT" ]; then
+        require_pve "$TOOL_REQUIRES_PVE" || exit 2
+    fi
+    PMN_BACKUP_DIR="$PMN_BACKUP_BASE/$(date +%Y%m%d-%H%M%S)-$t"
+    export PMN_DRY_RUN PMN_YES PMN_BACKUP_DIR
+    local mode=""
+    [ "$PMN_DRY_RUN" = "1" ] && mode=", dry-run"
+    log "$action $t $TOOL_VERSION from $(current_ref) ($(current_commit))${extra[*]:+, options: ${extra[*]}}$mode"
+    tool_env "$t" "$PMN_ROOT/$t/$action" ${extra[@]+"${extra[@]}"} || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$PMN_DRY_RUN" = "1" ]; then
+        [ "$rc" -eq 0 ] || log "$action $t ended with code $rc"
+        return "$rc"
+    fi
+    if [ "$action" = install ]; then
+        mkdir -p "$PMN_STATE_DIR"
+        opts=${extra[*]:-}
+        {
+            printf 'version=%s\n' "$TOOL_VERSION"
+            printf 'ref=%s\n' "$(current_ref)"
+            printf 'commit=%s\n' "$(git_root rev-parse HEAD)"
+            printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'options=%s\n' "$opts"
+        } > "$PMN_STATE_DIR/$t"
+    else
+        rm -f "$PMN_STATE_DIR/$t"
+    fi
+    log "$action $t completed"
+}
+
+main() {
+    local cmd=${1:-}
+    [ $# -eq 0 ] || shift
+    case "$cmd" in
+        update) cmd_update "$@" ;;
+        list) cmd_list ;;
+        status) cmd_status "$@" ;;
+        install|uninstall) cmd_action "$cmd" "$@" ;;
+        version) cmd_version ;;
+        -h|--help|help) usage ;;
+        "") usage >&2; exit 2 ;;
+        *) err "unknown command: $cmd"; usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

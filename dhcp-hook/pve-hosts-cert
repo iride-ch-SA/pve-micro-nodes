@@ -1,0 +1,56 @@
+#!/bin/sh
+# /usr/local/sbin/pve-hosts-cert
+# Regenerates /etc/pve/local/pve-ssl.pem if its SAN does not contain the node IP
+# or the FQDN that PVE derives from /etc/resolv.conf.
+# Run by pve-hosts-cert.service: at boot and on request of the pve-hosts hook.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+TAG="pve-hosts-cert"
+CERT="/etc/pve/local/pve-ssl.pem"
+
+log() { logger -t "$TAG" "$*"; }
+
+short=$(head -n1 /etc/hostname | tr -d '[:space:]')
+[ -n "$short" ] || { log "empty hostname, no changes"; exit 1; }
+
+# Same rule as PVE (get_ip_from_hostname): the first non-loopback address.
+ip=$(getent ahosts "$short" | awk '$1 !~ /^127\./ && $1 != "::1" { print $1; exit }')
+[ -n "$ip" ] || { log "$short does not resolve to a non-loopback IP, no changes"; exit 1; }
+
+# Same rule as PVE: the first domain of the last search or domain line.
+domain=$(awk '$1 == "search" || $1 == "domain" { d = $2 } END { sub(/\.$/, "", d); print d }' /etc/resolv.conf 2>/dev/null)
+want_fqdn=${domain:+$short.$domain}
+
+[ -f "$CERT" ] || { log "$CERT missing: pmxcfs not mounted?"; exit 1; }
+
+san() {
+    openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null |
+        tail -n +2 | tr ',' '\n' | sed 's/^[[:space:]]*//'
+}
+
+# The SAN is fine if it contains the IP and, when resolv.conf provides a domain, the FQDN.
+san_ok() {
+    san | grep -Fqx "IP Address:$ip" || return 1
+    [ -z "$want_fqdn" ] || san | grep -Fqx "DNS:$want_fqdn"
+}
+
+if san_ok; then
+    exit 0
+fi
+
+log "SAN lacks IP $ip or FQDN ${want_fqdn:-(none)}: regenerating $CERT"
+if ! pvecm updatecerts --force >/dev/null 2>&1; then
+    log "pvecm updatecerts --force failed"
+    exit 1
+fi
+
+if ! san_ok; then
+    log "certificate regenerated but SAN still lacks IP $ip or FQDN ${want_fqdn:-(none)}"
+    exit 1
+fi
+
+fqdn=$(san | sed -n 's/^DNS:\(.*\..*\)$/\1/p' | head -n1)
+log "certificate regenerated: IP $ip, FQDN ${fqdn:-none}"
+
+systemctl try-reload-or-restart pveproxy.service spiceproxy.service
+exit 0

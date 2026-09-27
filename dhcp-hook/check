@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# dhcp-hook/check — verifies that dhcp-hook is installed and consistent with the repository.
+# Codes: 0 installed and consistent, 1 not installed, 2 installed but diverging.
+set -euo pipefail
+
+: "${PMN_ROOT:?eseguire tramite pmn}" "${PMN_TOOL_DIR:?eseguire tramite pmn}"
+# shellcheck source=lib/common.sh
+. "$PMN_ROOT/lib/common.sh"
+# shellcheck source=dhcp-hook/common.sh
+. "$PMN_TOOL_DIR/common.sh"
+
+present=0 bad=0
+ok() { echo "ok  $*"; }
+ko() { echo "KO  $*"; bad=1; }
+
+while IFS=: read -r src dst mode; do
+    if [ ! -f "$dst" ]; then
+        ko "$dst missing"
+        continue
+    fi
+    present=1
+    if ! cmp -s "$PMN_TOOL_DIR/$src" "$dst"; then
+        ko "$dst differs from the repository"
+    elif [ "$(file_mode "$dst")" != "$mode" ]; then
+        ko "$dst mode $(file_mode "$dst"), expected $mode"
+    elif [ -z "$S" ] && [ "$(file_owner "$dst")" != "root:root" ]; then
+        ko "$dst owner $(file_owner "$dst"), expected root:root"
+    else
+        ok "$dst"
+    fi
+done <<< "$FILES"
+
+if [ "$present" -eq 0 ]; then
+    echo "no dhcp-hook file installed"
+    exit 1
+fi
+
+if [ -z "$S" ]; then
+    if systemctl is-enabled --quiet pve-hosts-cert.service 2>/dev/null; then
+        ok "pve-hosts-cert.service enabled"
+    else
+        ko "pve-hosts-cert.service not enabled"
+    fi
+fi
+
+dhclient_residue && ko "$DHCLIENT_CONF still contains the pve-hosts block of earlier versions"
+
+method=$(vmbr0_method)
+if [ "$method" = dhcp ]; then ok "$IFACE inet dhcp"; else ko "$IFACE inet ${method:-missing}, expected dhcp"; fi
+
+short=$(node_short)
+domain=$(node_domain)
+if [ -n "$domain" ]; then ok "FQDN $short.$domain in $HOSTS"; else ko "no FQDN $short.<domain> in $HOSTS"; fi
+
+lines=$(awk -v s="$short" '/^[[:space:]]*#/ { next } { for (i = 2; i <= NF; i++) if ($i == s) { print $1; break } }' "$HOSTS")
+count=$(printf '%s' "$lines" | grep -c . || true)
+cur=$(vmbr0_ip)
+if [ "$count" -ne 1 ]; then
+    ko "$HOSTS has $count lines for $short, expected one"
+elif [ -z "$cur" ]; then
+    ko "$IFACE has no IPv4 address: cannot compare with $HOSTS"
+elif [ "$lines" != "$cur" ]; then
+    ko "$HOSTS maps $short to $lines, $IFACE has $cur"
+else
+    ok "$HOSTS: $short -> $cur, same as $IFACE"
+fi
+
+[ "$bad" -eq 0 ] || exit 2
+exit 0
